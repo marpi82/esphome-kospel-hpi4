@@ -1,0 +1,784 @@
+################################################################################
+# Kospel HPI-4 — ESPHome config
+# Board:    Waveshare ESP32-S3-RS485-CAN (SKU 32154)
+# Proto:    Modbus RTU over RS485, 9600 8N1, slave addr 88
+# Encoding: uint16 AB→BA swap on almost all registers
+# Author:   marpi82 - based on protocol reverse-engineering
+################################################################################
+
+substitutions:
+  device_name: hpi4-kospel
+  friendly_name: "Kospel HPI-4"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.8.0
+  on_boot:
+    priority: -100
+    then:
+      - if:
+          condition:
+            switch.is_off: sw_modbus_polling
+          then:
+            - component.suspend: hpi4
+          else:
+            - component.resume: hpi4
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_encryption_key 
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  include_internal: true   # also exposes sensors marked with internal: true
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+
+################################################################################
+# UART + Modbus
+# Waveshare ESP32-S3-RS485-CAN: TX=GPIO17, RX=GPIO18, DE/RE=GPIO21
+################################################################################
+uart:
+  id: uart_rs485
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+modbus:
+  id: modbus1
+  uart_id: uart_rs485
+  flow_control_pin: GPIO21
+  #turnaround_time: 100ms   # default 600ms
+
+modbus_controller:
+  - id: hpi4
+    address: 88
+    modbus_id: modbus1
+    update_interval: 3s
+
+################################################################################
+# GLOBALS — state of enable/always-on logic
+################################################################################
+globals:
+  - id: always_on_mode
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+################################################################################
+# INTERVAL — "always on" logic
+################################################################################
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: return id(always_on_mode) && !id(sw_enable).state;
+          then:
+            - switch.turn_on: sw_enable
+            - logger.log: "always_on: re-enable sw_enable"
+
+################################################################################
+# SENSORS — reg 100
+################################################################################
+sensor:
+  # --- reg 100: pump status (raw, for diagnostics) ---
+  #- platform: modbus_controller
+  #  modbus_controller_id: hpi4
+  #  id: r100_raw
+  #  name: "r100 pump status raw"
+  #  register_type: holding
+  #  address: 100
+  #  value_type: U_WORD
+  #  internal: true
+  #  filters: [lambda: return x;]
+
+  # --- reg 134..137: configuration parameters (constant) ---
+  #- platform: modbus_controller
+  #  modbus_controller_id: hpi4
+  #  id: r134_raw
+  #  name: "r134 config raw"
+  #  register_type: holding
+  #  address: 134
+  #  value_type: U_WORD
+  #  internal: true
+  #  filters: [lambda: return x;]
+
+  #- platform: modbus_controller
+  #  modbus_controller_id: hpi4
+  #  id: r135_raw
+  #  name: "r135 config raw"
+  #  register_type: holding
+  #  address: 135
+  #  value_type: U_WORD
+  #  internal: true
+  #  filters: [lambda: return x;]
+
+  #- platform: modbus_controller
+  #  modbus_controller_id: hpi4
+  #  id: r136_raw
+  #  name: "r136 config raw"
+  #  register_type: holding
+  #  address: 136
+  #  value_type: U_WORD
+  #  internal: true
+  #  filters: [lambda: return x;]
+
+  # ============================================================
+  # reg 170..188 — measurement data, read as a single FC3 block
+  # ESPHome automatically groups continuous address ranges into a single
+  # Modbus frame when they are on the same modbus_controller
+  # ============================================================
+
+  # P01 — DHW temperature [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p01
+    name: "P01 Temperatura CWU"
+    register_type: holding
+    address: 170
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  # P02 — Refrigerant temperature before compressor [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p02
+    name: "P02 Temperatura czynnika przed sprężarką"
+    register_type: holding
+    address: 171
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P03 — Refrigerant temperature after compressor [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p03
+    name: "P03 Temperatura czynnika po sprężarce"
+    register_type: holding
+    address: 172
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # Evaporation temperature [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: evaporation_temp
+    name: "Temperatura parowania czynnika"
+    register_type: holding
+    address: 173
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P04 — Refrigerant temperature after evaporator [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p04
+    name: "P04 Temperatura czynnika po parowniku"
+    register_type: holding
+    address: 174
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P05 — Intake air temperature [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p05
+    name: "P05 Temperatura zasysanego powietrza"
+    register_type: holding
+    address: 175
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P06 — Water temperature before condenser [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p06
+    name: "P06 Temperatura wody przed skraplaczem"
+    register_type: holding
+    address: 176
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P07 — Water temperature after condenser [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p07
+    name: "P07 Temperatura wody po skraplaczu"
+    register_type: holding
+    address: 177
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # Calculated water ΔT = P07 - P06 [°C]
+  - platform: template
+    id: dt_water
+    name: "ΔT wody"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    lambda: |-
+      if (isnan(id(p07).state) || isnan(id(p06).state)) return NAN;
+      return id(p07).state - id(p06).state;
+
+  # P08 — Control board temperature [°C × 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p08
+    name: "P08 Temperatura płyty sterującej"
+    register_type: holding
+    address: 178
+    value_type: S_WORD_S
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.1
+
+  # P09 — Refrigerant pressure before compressor [bar × 0.01]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p09
+    name: "P09 Ciśnienie czynnika"
+    register_type: holding
+    address: 179
+    value_type: U_WORD_S
+    unit_of_measurement: "bar"
+    accuracy_decimals: 2
+    device_class: pressure
+    state_class: measurement
+    disabled_by_default: true
+    filters:
+      - multiply: 0.01
+
+  # P11 — Expansion valve position in steps [steps]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p11
+    name: "P11 Zawór rozprężny (kroki)"
+    register_type: holding
+    address: 180
+    value_type: U_WORD_S
+    icon: "mdi:valve"
+    accuracy_decimals: 0
+    state_class: measurement
+    disabled_by_default: true
+
+  # P12 — Expansion valve position in % [%]
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p12
+    name: "P12 Zawór rozprężny (%)"
+    register_type: holding
+    address: 181
+    value_type: U_WORD_S
+    icon: "mdi:valve"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    disabled_by_default: true
+
+  # 4-way valve position: 100=heating, 0=defrost
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: four_way_valve
+    name: "Zawór 4-drogowy (100=grzanie, 0=defrost)"
+    register_type: holding
+    address: 183
+    value_type: U_WORD_S
+    accuracy_decimals: 0
+    state_class: measurement
+    internal: true
+
+   # Work phase/mode (2=idle, 3=startup1, 4=startup2, 5=operation, 6=stop)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: work_phase
+    name: "Faza pracy"
+    register_type: holding
+    address: 184
+    value_type: U_WORD_S
+    accuracy_decimals: 0
+    state_class: measurement
+    internal: true
+
+  # Superheat total = P02 - T_evaporation [°C]
+  - platform: template
+    id: superheat_total
+    name: "Przegrzanie całkowite"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    lambda: |-
+      if (isnan(id(p02).state) || isnan(id(evaporation_temp).state)) return NAN;
+      return id(p02).state - id(evaporation_temp).state;
+  
+  # Superheat evaporator = P04 - T_evaporation [°C]
+  - platform: template
+    id: superheat_evaporator
+    name: "Przegrzanie parownika"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    lambda: |-
+      if (isnan(id(p04).state) || isnan(id(evaporation_temp).state)) return NAN;
+      return id(p04).state - id(evaporation_temp).state;
+
+################################################################################
+# BINARY SENSORS — bits of register 185
+# Native bitmask sensors on reg 185
+################################################################################
+binary_sensor:
+  # reg 185 bit0 - debug status (always 0x00)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_r185_b0
+    name: "r185 b0"
+    register_type: holding
+    address: 185
+    bitmask: 0x0001
+    internal: true
+
+  # reg 185 bit1 - debug status
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_controller_ready
+    name: "Sterownik gotowy"
+    register_type: holding
+    address: 185
+    bitmask: 0x0002
+    internal: true
+
+  # reg 185 bit2 - debug status (enabled when upper source circulation active, but disables after compressor stop?)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_r185_b2
+    name: "r185 b2"
+    register_type: holding
+    address: 185
+    bitmask: 0x0004
+    internal: true
+
+  # reg 185 bit3 - fan (lower source air circulation)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_lower_source_circulation
+    name: "Wentylator"
+    icon: "mdi:fan"
+    device_class: running
+    register_type: holding
+    address: 185
+    bitmask: 0x0008
+
+  # reg 185 bit4 - debug status
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_r185_b4
+    name: "r185 b4"
+    register_type: holding
+    address: 185
+    bitmask: 0x0010
+    internal: true
+
+  # reg 185 bit5 — DHW water pump (upper source water circulation)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_upper_source_circulation
+    name: "Pompa wody"
+    icon: "mdi:pump"
+    device_class: running
+    register_type: holding
+    address: 185
+    bitmask: 0x0020
+
+  # reg 185 bit6 — compressor
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_compressor
+    name: "Sprężarka"
+    icon: "mdi:air-conditioner"
+    device_class: running
+    register_type: holding
+    address: 185
+    bitmask: 0x0040
+
+  # reg 185 bit7 — error status
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_error
+    name: "Błąd"
+    icon: "mdi:alert"
+    device_class: problem
+    register_type: holding
+    address: 185
+    bitmask: 0x0080
+
+  # reg 185 bit8 — work allowed (warming up allowed)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_work_allowed
+    name: "Zezwolenie na pracę"
+    register_type: holding
+    address: 185
+    bitmask: 0x0100
+    internal: true
+
+  # reg 185 bit9 — heat allowed (warmed up and allowed to heat)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_heat_allowed
+    name: "Zezwolenie na podgrzewanie"
+    register_type: holding
+    address: 185
+    bitmask: 0x0200
+    internal: true
+
+  # reg 185 bit10 — NA input - P10
+  # gaśnie też jak N03 off
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: p10
+    name: "P10 wejście NA"
+    register_type: holding
+    address: 185
+    bitmask: 0x0400
+    disabled_by_default: true
+
+  # reg 185 bit11 - warmup phase (from fan run to stable phase)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_warmup_phase
+    name: "Faza rozruchu"
+    register_type: holding
+    address: 185
+    bitmask: 0x0800
+    internal: true
+  
+  # reg 185 bit12 - stable operation phase (everything running and warmed up)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_stable_phase
+    name: "Faza stabilnej pracy"
+    register_type: holding
+    address: 185
+    bitmask: 0x1000
+    internal: true
+  
+  # reg 185 bit13 - shutdown phase (from stopping compressor to fan stopped)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_shutdown_phase
+    name: "Faza zatrzymania"
+    register_type: holding
+    address: 185
+    bitmask: 0x2000
+    internal: true
+
+  # reg 185 bit14 - debug status (always 0x00)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_r185_b14
+    name: "r185 b14"
+    register_type: holding
+    address: 185
+    bitmask: 0x4000
+    internal: true
+
+  # reg 185 bit15 - debug status (always 0x00)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: st_r185_b15
+    name: "r185 b15"
+    register_type: holding
+    address: 185
+    bitmask: 0x8000
+    internal: true
+
+  # Operating mode: Off = sw_enable=0 OR p10=0
+  - platform: template
+    id: st_mode_off
+    name: "Tryb pracy: wyłączony"
+    internal: true
+    lambda: |-
+      return !id(sw_enable).state || !id(p10).state;
+
+  # Operating mode: On = st_mode_off=0 AND st_work_allowed=1 AND st_heat_allowed=1
+  - platform: template
+    id: st_mode_on
+    name: "Tryb pracy: włączony"
+    internal: true
+    lambda: |-
+      return !id(st_mode_off).state && id(st_work_allowed).state && id(st_heat_allowed).state;
+
+  # Operating mode: Warn = st_mode_off=0 AND st_work_allowed=1 AND st_heat_allowed=0
+  - platform: template
+    id: st_mode_warn
+    name: "Tryb pracy: przygotowanie"
+    internal: true
+    lambda: |-
+      return !id(st_mode_off).state && id(st_work_allowed).state && !id(st_heat_allowed).state;
+
+  - platform: template
+    id: st_four_way_valve
+    name: "Zawór 4-drogowy"
+    icon: "mdi:valve"
+    device_class: opening
+    disabled_by_default: true
+    lambda: |-
+      return id(four_way_valve).state >= 50;
+
+  - platform: template
+    id: st_four_way_valve_heat
+    name: "Obieg czynnika: grzanie"
+    icon: "mdi:fire"
+    device_class: heat
+    disabled_by_default: true
+    lambda: |-
+      return id(st_compressor).state && id(st_four_way_valve).state;
+
+  - platform: template
+    id: st_four_way_valve_defrost
+    name: "Obieg czynnika: defrost"
+    icon: "mdi:snowflake"
+    device_class: cold
+    disabled_by_default: true
+    lambda: |-
+      return id(st_compressor).state && !id(st_four_way_valve).state;
+
+################################################################################
+# TEXT — operating phase (readable description)
+################################################################################
+text_sensor:
+  - platform: template
+    id: operating_phase_text
+    name: "Faza pracy"
+    lambda: |-
+      if (isnan(id(work_phase).state)) return {};
+      int ph = (int)id(work_phase).state;
+      switch(ph) {
+        case 2: return {"postój"};
+        case 3: return {"przygotowanie"}; // DHW pump start
+        case 4: return {"rozruch"}; // compressor start
+        case 5: return {"praca"};
+        case 6: return {"zatrzymanie"};
+        case 9: return {"oczekiwanie"}; // ?
+        default: return std::string("faza " + std::to_string(ph));
+      }
+    update_interval: 1s
+
+  - platform: template
+    id: state_text
+    name: "Stan"
+    lambda: |-
+      if (id(st_mode_off).state)  return {"wyłączona"};
+      if (id(st_mode_warn).state) return {"przygotowanie"};
+      if (id(st_mode_on).state)   return {"załączona"};
+      return {"stop"};
+    update_interval: 1s
+
+  # - platform: template
+  #   id: errors_text
+  #   name: "Występujące błędy"
+  #   icon: "mdi:alert-decagram"
+  #   lambda: |-
+  #     if (isnan(id(r187_raw).state)) return std::string("N/A");
+  #     uint16_t raw = (uint16_t)id(r187_raw).state;
+  #     uint16_t decoded = ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF);
+  # 
+  #     if (decoded == 0) return std::string("b00 (brak błędów)");
+  # 
+  #     std::string errors = "";
+  #     for (int i = 0; i < 16; i++) {
+  #       if ((decoded >> i) & 1) {
+  #         if (!errors.empty()) errors += ", ";
+  #         char buf[5];
+  #         snprintf(buf, sizeof(buf), "b%02d", i);
+  #         errors += buf;
+  #       }
+  #     }
+  #     return errors;
+
+################################################################################
+# SWITCHES — enable and always-on
+################################################################################
+switch:
+  - platform: template
+    name: "Transmisja modbus"
+    id: sw_modbus_polling
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - component.resume:
+          id: hpi4
+    turn_off_action:
+      - component.suspend:
+          id: hpi4
+    internal: true
+  
+  # Enable switch
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: sw_enable
+    name: "Aktywacja (zezwolenie na pracę)"
+    icon: "mdi:power"
+    restore_mode: RESTORE_DEFAULT_OFF
+    register_type: holding
+    address: 186
+    bitmask: 0x0100 # bit8
+    use_write_multiple: true
+
+  # Switch "always enabled"
+  - platform: template
+    id: sw_always_enabled
+    name: "Zawsze aktywna (auto aktywacja)"
+    icon: "mdi:autorenew"
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(always_on_mode);
+    turn_on_action:
+      - globals.set:
+          id: always_on_mode
+          value: 'true'
+      - switch.turn_on: sw_enable
+    turn_off_action:
+      - globals.set:
+          id: always_on_mode
+          value: 'false'
+
+################################################################################
+# NUMBERS — setpoint editing with range and step 1
+################################################################################
+number:
+  # N01 — desired CWU tank temperature (20–55°C, step 1°C)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: num_n01
+    name: "N01 Nastawa temperatury CWU"
+    icon: "mdi:thermometer-water"
+    register_type: holding
+    address: 202
+    value_type: U_WORD_S
+    min_value: 20
+    max_value: 55
+    step: 1
+    mode: box
+    use_write_multiple: true
+    unit_of_measurement: "°C"
+    multiply: 10
+
+  # N02 — minimum air temperature (5–15°C, step 1°C)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: num_n02
+    name: "N02 Nastawa minimalnej temperatury powietrza"
+    icon: "mdi:thermometer-minus"
+    register_type: holding
+    address: 203
+    value_type: U_WORD_S
+    min_value: 5
+    max_value: 15
+    step: 1
+    mode: box
+    use_write_multiple: true
+    unit_of_measurement: "°C"
+    multiply: 10
+
+  # reg 204 — unknown (same value as r202)
+  - platform: modbus_controller
+    modbus_controller_id: hpi4
+    id: r204
+    name: "r204 (kopia N01?)"
+    register_type: holding
+    address: 204
+    value_type: U_WORD_S
+    min_value: 20
+    max_value: 55
+    step: 1
+    mode: box
+    use_write_multiple: true
+    unit_of_measurement: "°C"
+    internal: true
+    multiply: 10
